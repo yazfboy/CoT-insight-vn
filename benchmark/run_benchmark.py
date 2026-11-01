@@ -22,10 +22,10 @@ OUT_DIR = os.path.join(BASE_DIR, "benchmark", "results")
 os.makedirs(OUT_DIR, exist_ok=True)
 CKPT_CSV = os.path.join(OUT_DIR, "checkpoint.csv")
 
-# Chi dung dung 2 model nay: 1 Nho va 1 Lon
+# 2 Model: Small (4B tham so, quota 14.400 req/day) va Large (Flash Lite toc do cao)
 MODELS = {
-    "Small": {"id": "gemini-3.5-flash-lite", "in_price": 0.075, "out_price": 0.30},
-    "Large": {"id": "gemini-3.5-flash", "in_price": 0.15, "out_price": 0.60},
+    "Small": {"id": "gemma-3-4b-it", "in_price": 0.04, "out_price": 0.08},
+    "Large": {"id": "gemini-3.5-flash-lite", "in_price": 0.075, "out_price": 0.30},
 }
 
 METHODS = [
@@ -105,12 +105,12 @@ class KeyPool:
         with self.lock:
             msg = err.lower()
             if "429" in msg or "quota" in msg or "resource_exhausted" in msg:
-                if "per_day" in msg or "daily" in msg or "limit: 0" in msg:
+                if "requests per day" in msg or "per_day" in msg or "daily" in msg or "limit: 0" in msg:
                     self.dead[i] = True
-                    tqdm.write(f"[Key #{i+1}] Het token trong ngay -> khoa key")
+                    tqdm.write(f"[Key #{i+1}] Het han muc ngay -> khoa key")
                 else:
-                    self.next_free[i] = max(time.time(), self.next_free[i]) + 20.0
-                    tqdm.write(f"[Key #{i+1}] Cham rate limit ({self.toks[i]} tok) -> doi key")
+                    self.next_free[i] = max(time.time(), self.next_free[i]) + 15.0
+                    tqdm.write(f"[Key #{i+1}] Cham rate limit phut ({self.toks[i]} tok) -> doi key")
             elif "invalid" in msg or "403" in msg or "401" in msg:
                 self.dead[i] = True
                 tqdm.write(f"[Key #{i+1}] Key loi -> bo qua")
@@ -118,7 +118,7 @@ class KeyPool:
     def summary(self):
         print("\nTrang thai API keys:")
         for i in range(self.n):
-            st = "HET_TOKEN" if self.dead[i] else "OK"
+            st = "HET_QUOTA_NGAY" if self.dead[i] else "OK"
             print(f"  Key #{i+1}: {self.reqs[i]} reqs | {self.toks[i]} tokens | {st}")
 
 
@@ -249,8 +249,9 @@ def make_prompt(row, method, lang):
 
 
 def parse_output(text, q_type):
-    if not text:
-        return "", 50.0
+    # Chặn lỗi mạng/API để không bóc nhầm số giây retryDelay làm đáp án
+    if not text or text.startswith("ERR:"):
+        return "API_ERR", 0.0
 
     conf = 50.0
     m_conf = re.search(r"\[?(?:Độ tự tin|Confidence)\]?\s*:\s*(\d+(?:\.\d+)?)", text, re.I)
@@ -280,6 +281,8 @@ def parse_output(text, q_type):
 
 
 def is_match(pred, gt):
+    if pred == "API_ERR" or not pred:
+        return 0
     p = str(pred).strip().upper().replace(",", "")
     g = str(gt).strip().upper().replace(",", "")
     if g.endswith(".0"):
@@ -336,9 +339,9 @@ def eval_row(row, m_key, method, lang, pool):
             r_txt, ti, to, l_s, kn = ask_llm(pool, cfg["id"], prompt, 0.7)
             k_num = kn
             pa, cf = parse_output(r_txt, q_type)
-            if pa:
+            if pa and pa != "API_ERR":
                 ans_list.append(pa)
-            conf_list.append(cf)
+                conf_list.append(cf)
             logs.append(f"[Run {i+1} | Key#{kn} | Ans:{pa}]\n{r_txt}")
             tok_in += ti
             tok_out += to
@@ -346,10 +349,10 @@ def eval_row(row, m_key, method, lang, pool):
 
         if ans_list:
             pred, cnt = Counter(ans_list).most_common(1)[0]
-            agree = round((cnt / SC_RUNS) * 100, 1)
+            agree = round((cnt / len(ans_list)) * 100, 1)
         else:
-            pred, agree = "", 0.0
-        conf = round(sum(conf_list) / len(conf_list), 1) if conf_list else 50.0
+            pred, agree = "API_ERR", 0.0
+        conf = round(sum(conf_list) / len(conf_list), 1) if conf_list else 0.0
         raw = "\n\n".join(logs)
 
     correct = is_match(pred, gt)
@@ -403,7 +406,8 @@ def main():
     df = df.dropna(subset=["Đáp án"]).drop_duplicates(subset=["ID"], keep="last").reset_index(drop=True)
 
     if TEST_MODE:
-        ids = ["EASY_001", "EASY_026", "HARD_144"]
+        # Test 5 cau dai dien co ca cau bay de xem lỗi suy luan that su
+        ids = ["EASY_001", "EASY_011", "MEDIUM_069", "MEDIUM_085", "HARD_144"]
         df_run = df[df["ID"].isin(ids)].copy()
         print(f"Mode: TEST ({len(df_run)} cau x 2 models x 2 ngon ngu x 6 phuong phap)")
     else:
@@ -413,9 +417,11 @@ def main():
     done, rows = set(), []
     if not TEST_MODE and os.path.exists(CKPT_CSV):
         df_ck = pd.read_csv(CKPT_CSV)
+        # Chi giu lai cac task da chay thanh cong (khong bi API_ERR)
+        df_ck = df_ck[df_ck["Predicted"] != "API_ERR"]
         done = set(df_ck["Task_Key"].tolist())
         rows = df_ck.to_dict("records")
-        print(f"Resumed {len(done)} tasks tu {CKPT_CSV}")
+        print(f"Resumed {len(done)} tasks hop le tu {CKPT_CSV}")
 
     tasks = [
         (r, mk, m, l)
@@ -445,7 +451,9 @@ def main():
     pool.summary()
 
     df_all = pd.DataFrame(rows)
-    df_sum = df_all.groupby(["Model", "Model_ID", "Language", "Method", "Difficulty"]).agg(
+    df_valid = df_all[df_all["Predicted"] != "API_ERR"]
+
+    df_sum = df_valid.groupby(["Model", "Model_ID", "Language", "Method", "Difficulty"]).agg(
         Count=("ID", "count"),
         Acc_Pct=("Correct", lambda x: round(x.mean() * 100, 2)),
         Avg_Tok=("Total_Tokens", lambda x: round(x.mean(), 1)),
@@ -454,7 +462,7 @@ def main():
         Avg_Conf=("Confidence", lambda x: round(x.mean(), 1)),
     ).reset_index()
 
-    df_leak = df_all[df_all["Method"].isin(["4_Few_Shot_CoT", "6_Few_Shot_CoT_Leaked"])].groupby(
+    df_leak = df_valid[df_valid["Method"].isin(["4_Few_Shot_CoT", "6_Few_Shot_CoT_Leaked"])].groupby(
         ["Model", "Language", "Leak_Status", "Method"]
     ).agg(
         Count=("ID", "count"),
@@ -463,7 +471,8 @@ def main():
         Avg_Tok=("Total_Tokens", lambda x: round(x.mean(), 1)),
     ).reset_index()
 
-    df_err = df_all[(df_all["Correct"] == 0) & (df_all["Method"].str.contains("CoT"))].copy()
+    # Chi loc cac cau AI tra loi sai that su (khong lay loi API_ERR)
+    df_err = df_valid[df_valid["Correct"] == 0].sort_values(by="Method", ascending=False).copy()
     for col in ["Reasoning_State", "Error_Type", "Faithfulness", "Note"]:
         df_err[col] = ""
 
@@ -476,7 +485,7 @@ def main():
         df_leak.to_excel(w, sheet_name="3_Leak_Compare", index=False)
         df_err.to_excel(w, sheet_name="4_Errors", index=False)
 
-    print(f"Saved: {out}")
+    print(f"Saved: {out} (So dong AI lam sai that su trong 4_Errors: {len(df_err)})")
 
 
 if __name__ == "__main__":
