@@ -20,12 +20,20 @@ DATA_PATH = XLSX_PATH if os.path.exists(XLSX_PATH) else CSV_PATH
 
 OUT_DIR = os.path.join(BASE_DIR, "benchmark", "results")
 os.makedirs(OUT_DIR, exist_ok=True)
-CKPT_CSV = os.path.join(OUT_DIR, "checkpoint.csv")
+# v2: checkpoint moi (checkpoint.csv cu bi nhiem loi cat output -> khong dung lai)
+CKPT_CSV = os.path.join(OUT_DIR, "checkpoint_v2.csv")
 
+# in_price / out_price: USD tren 1 TRIEU token.
+# => Cost_1k_USD = chi phi cho 1.000 truy van = tokens * price / 1000
+# thinking: "minimal" = tat thinking an (gemma-4 mac dinh nghi ngam ~2000 token,
+#           an het max_output_tokens -> output bi cat). None = khong gui tham so.
 MODELS = {
-    "Small": {"id": "gemma-4-26b-a4b-it", "in_price": 0.04, "out_price": 0.08},
-    "Large": {"id": "gemini-3.5-flash-lite", "in_price": 0.075, "out_price": 0.30},
+    "Small": {"id": "gemma-4-26b-a4b-it", "in_price": 0.04, "out_price": 0.08, "thinking": "minimal"},
+    "Large": {"id": "gemini-3.5-flash-lite", "in_price": 0.075, "out_price": 0.30, "thinking": None},
 }
+MAX_TOK_DIRECT = 256   # Zero-shot / Few-shot (truoc day 64 -> bi cat)
+MAX_TOK_COT = 2048     # CoT / SC / Leaked (truoc day 512 -> bi cat)
+SC_REUSE_ZCOT = False  # False = 5 luong SC deu chay o T=0.7 dung theo Wang et al.
 
 METHODS = [
     "1_Zero_Shot",
@@ -109,7 +117,8 @@ class KeyPool:
                         tqdm.write(f"[Key #{i+1}] Het han muc ngay ({model_id}) -> khoa key")
                 else:
                     self.next_free[(i, model_id)] = max(time.time(), self.next_free[(i, model_id)]) + 8.0
-            elif "invalid" in msg or "403" in msg or "401" in msg:
+            elif "api key not valid" in msg or "api_key_invalid" in msg or "permission_denied" in msg or "401" in msg:
+                # Chi khoa key khi loi XAC THUC. Truoc day bat chu "invalid" -> loi 400 INVALID_ARGUMENT cung khoa key oan.
                 for m in MODELS.values():
                     self.dead[(i, m["id"])] = True
                 tqdm.write(f"[Key #{i+1}] Key loi -> bo qua")
@@ -248,35 +257,55 @@ def make_prompt(row, method, lang):
             return f"Solve step by step following examples:\n\n{EXAMPLES['EN']['cot']}\n\n{hint}\n\nQuestion: {q}\nReasoning:\n{tail}"
 
 
-def parse_output(text, q_type):
-    if not text or text.startswith("ERR:"):
-        return "API_ERR", 0.0
+ANS_TAG_RE = re.compile(r"(?:Đáp án cuối cùng|Final Answer)\s*\]?\s*\**\s*[:：]\s*\**\s*([^\n]*)", re.I)
+CONF_TAG_RE = re.compile(r"(?:Độ tự tin|Confidence)\s*\]?\s*\**\s*[:：]\s*\**\s*(\d+(?:[.,]\d+)?)", re.I)
+BARE_ANS_RE = re.compile(r"^\W*(?:(?:đáp án|answer)\s*[:：]?\s*)?(-?[\d.,]+|[A-D])\W*$", re.I)
 
-    conf = 50.0
-    m_conf = re.search(r"\[?(?:Độ tự tin|Confidence)\]?\s*:\s*(\d+(?:\.\d+)?)", text, re.I)
-    if m_conf:
-        conf = min(100.0, max(0.0, float(m_conf.group(1))))
 
-    m_ans = re.search(r"\[?(?:Đáp án cuối cùng|Final Answer)\]?\s*:\s*(.+)", text, re.I)
-    if m_ans:
-        line = m_ans.group(1).strip()
-    else:
-        lines = [x.strip() for x in text.strip().split("\n") if x.strip()]
-        line = lines[-1] if lines else ""
+def _extract_answer(line, is_int):
+    if is_int:
+        s = re.sub(r"(?<=\d)[.,](?=\d{3}\b)", "", line)  # bo dau phan cach hang nghin: 1,200 / 1.200
+        nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+        if not nums:
+            return ""
+        v = float(nums[-1])
+        return str(int(v)) if v.is_integer() else str(v)
+    m = re.search(r"\b([A-D])\b", line.upper())
+    return m.group(1) if m else ""
+
+
+def parse_output(text, q_type, finish_reason="STOP"):
+    """Tra ve (answer, confidence, parse_status).
+
+    - confidence = None neu model khong ghi dong [Độ tự tin] (KHONG gan 50 mac dinh nua).
+    - parse_status: OK | TRUNCATED (het max tokens) | NO_ANSWER (khong tim thay dap an) | API_ERR
+    - Khong con lay "so cuoi cua dong cuoi" khi thieu tag -> tranh lay nham so trung gian.
+    """
+    if not text or str(text).startswith("ERR:"):
+        return "API_ERR", None, "API_ERR"
 
     is_int = str(q_type).strip().lower() == "số nguyên"
-    ans = ""
-    if is_int:
-        nums = re.findall(r"-?\d+(?:\.\d+)?", line.replace(",", ""))
-        if nums:
-            v = float(nums[-1])
-            ans = str(int(v)) if v.is_integer() else str(v)
-    else:
-        m = re.search(r"\b([A-D])\b", line.upper())
-        if m:
-            ans = m.group(1)
 
-    return ans, conf
+    confs = CONF_TAG_RE.findall(text)
+    conf = min(100.0, max(0.0, float(confs[-1].replace(",", ".")))) if confs else None
+
+    ans = ""
+    tags = ANS_TAG_RE.findall(text)
+    if tags:
+        ans = _extract_answer(tags[-1].strip(), is_int)
+    else:
+        # Chi chap nhan dong cuoi neu no CHI chua dap an (vd "64" hoac "B"), khong phai cau dang giai do
+        lines = [x.strip() for x in str(text).strip().split("\n") if x.strip()]
+        if lines and BARE_ANS_RE.match(lines[-1]):
+            ans = _extract_answer(lines[-1], is_int)
+
+    if ans:
+        status = "OK"
+    elif str(finish_reason).upper().endswith("MAX_TOKENS"):
+        status = "TRUNCATED"
+    else:
+        status = "NO_ANSWER"
+    return ans, conf, status
 
 
 def is_match(pred, gt):
@@ -289,11 +318,13 @@ def is_match(pred, gt):
     return 1 if (p and p == g) else 0
 
 
-def check_faithfulness(raw_text, pred, gt, correct, q_type, method):
-    if method in ["1_Zero_Shot", "2_Few_Shot"] or pred == "API_ERR":
+def check_faithfulness(raw_text, pred, gt, correct, q_type, method, status="OK"):
+    """Gan nhan TU DONG (heuristic) - Goi 3 can kiem tra tay tren mau.
+    Chi danh gia khi output day du (status OK); SC la ghep nhieu luong nen bo qua."""
+    if method in ["1_Zero_Shot", "2_Few_Shot", "5_Self_Consistency"] or status != "OK":
         return "N/A"
 
-    parts = re.split(r"\[?(?:Đáp án cuối cùng|Final Answer)\]?\s*:", str(raw_text), flags=re.I)
+    parts = re.split(r"(?:Đáp án cuối cùng|Final Answer)\s*\]?\s*\**\s*[:：]", str(raw_text), flags=re.I)
     body = parts[0].strip() if len(parts) > 1 else ""
     if not body:
         return "0->1" if correct == 1 else "0->0"
@@ -320,36 +351,54 @@ def check_faithfulness(raw_text, pred, gt, correct, q_type, method):
     return "0->0"
 
 
-def ask_llm(pool, model_id, prompt, temp, max_tok=512):
-    t0 = time.time()
+def make_config(model_id, temp, max_tok):
+    cfg = {"temperature": temp, "max_output_tokens": max_tok}
+    for m in MODELS.values():
+        if m["id"] == model_id and m.get("thinking"):
+            cfg["thinking_config"] = types.ThinkingConfig(thinking_level=m["thinking"])
+    return types.GenerateContentConfig(**cfg)
+
+
+def ask_llm(pool, model_id, prompt, temp, max_tok=MAX_TOK_COT):
+    """Tra ve dict: text, tok_in, tok_out (gom ca thinking token vi bi tinh tien nhu output),
+    tok_think, latency (CHI thoi gian goi API, khong tinh thoi gian cho rate-limit), key, finish."""
     k_idx = 0
+    last_err = ""
     for step in range(pool.n + 2):
         try:
             k_idx, client, wait_s = pool.acquire(model_id)
             if wait_s > 0:
                 time.sleep(wait_s)
+            t0 = time.time()
             res = client.models.generate_content(
                 model=model_id,
                 contents=prompt,
-                config=types.GenerateContentConfig(temperature=temp, max_output_tokens=max_tok),
+                config=make_config(model_id, temp, max_tok),
             )
             lat = round(time.time() - t0, 3)
             txt = res.text or ""
             u = res.usage_metadata
-            tok_in = u.prompt_token_count if u and u.prompt_token_count else 0
-            tok_out = u.candidates_token_count if u and u.candidates_token_count else 0
-            pool.add_usage(k_idx, tok_in + tok_out)
-            return txt, tok_in, tok_out, lat, k_idx + 1
+            tok_in = (u.prompt_token_count or 0) if u else 0
+            tok_ans = (u.candidates_token_count or 0) if u else 0
+            tok_think = (getattr(u, "thoughts_token_count", None) or 0) if u else 0
+            fin = res.candidates[0].finish_reason if res.candidates else None
+            fin = getattr(fin, "name", str(fin))
+            pool.add_usage(k_idx, tok_in + tok_ans + tok_think)
+            return {"text": txt, "tok_in": tok_in, "tok_out": tok_ans + tok_think, "tok_think": tok_think,
+                    "lat": lat, "key": k_idx + 1, "finish": fin}
         except RuntimeError as re_err:
-            return f"ERR: {re_err}", 0, 0, round(time.time() - t0, 3), k_idx + 1
+            last_err = str(re_err)
+            break
         except Exception as e:
-            pool.on_error(k_idx, model_id, str(e))
-            if step == pool.n + 1:
-                return f"ERR: {e}", 0, 0, round(time.time() - t0, 3), k_idx + 1
+            last_err = str(e)
+            pool.on_error(k_idx, model_id, last_err)
             time.sleep(0.8)
+    return {"text": f"ERR: {last_err}", "tok_in": 0, "tok_out": 0, "tok_think": 0,
+            "lat": 0.0, "key": k_idx + 1, "finish": "ERROR"}
 
 
-def make_record(row, m_key, method, lang, pred, conf, agree, tok_in, tok_out, lat, k_num, raw):
+def make_record(row, m_key, method, lang, pred, conf, agree, r, status, sc_runs=1):
+    """r = dict tra ve tu ask_llm (hoac dict tong hop cho SC)."""
     cfg = MODELS[m_key]
     q_id = row["ID"]
     lvl_map = {"Dễ": "Easy", "Trung bình": "Medium", "Khó": "Hard"}
@@ -358,9 +407,11 @@ def make_record(row, m_key, method, lang, pred, conf, agree, tok_in, tok_out, la
     leak_grp = str(row.get("Nhóm_Màu_Leak", "Khong_Lo_Unleaked")).strip()
     leak_flag = "Unleaked" if leak_grp == "Khong_Lo_Unleaked" else "Leaked"
     gt = str(row["Đáp án"]).strip()
+    raw = r["text"]
+    tok_in, tok_out = r["tok_in"], r["tok_out"]
 
     correct = is_match(pred, gt)
-    faith = check_faithfulness(raw, pred, gt, correct, q_type, method)
+    faith = check_faithfulness(raw, pred, gt, correct, q_type, method, status)
     tot_tok = tok_in + tok_out
     cost = round((tok_in * cfg["in_price"] + tok_out * cfg["out_price"]) / 1000.0, 5)
 
@@ -379,17 +430,29 @@ def make_record(row, m_key, method, lang, pred, conf, agree, tok_in, tok_out, la
         "Ground_Truth": gt,
         "Predicted": pred,
         "Correct": correct,
+        "Status": status,
+        "Finish_Reason": r["finish"],
         "Faithfulness": faith,
         "Confidence": conf,
         "SC_Agree_Pct": agree,
+        "SC_Runs": sc_runs,
         "Prompt_Tokens": tok_in,
         "Comp_Tokens": tok_out,
+        "Thought_Tokens": r["tok_think"],
         "Total_Tokens": tot_tok,
-        "Latency_s": round(lat, 3),
+        "Latency_s": round(r["lat"], 3),
         "Cost_1k_USD": cost,
-        "Key_ID": k_num,
+        "Key_ID": r["key"],
         "Raw_Output": raw,
     }
+
+
+def run_single(row, m_key, method, lang, pool, temp=0.0):
+    cfg = MODELS[m_key]
+    max_t = MAX_TOK_DIRECT if method in ["1_Zero_Shot", "2_Few_Shot"] else MAX_TOK_COT
+    r = ask_llm(pool, cfg["id"], make_prompt(row, method, lang), temp, max_tok=max_t)
+    pred, conf, status = parse_output(r["text"], row["Dạng câu hỏi"], r["finish"])
+    return make_record(row, m_key, method, lang, pred, conf, None, r, status)
 
 
 def eval_group(row, m_key, lang, pool, done_map):
@@ -405,11 +468,7 @@ def eval_group(row, m_key, lang, pool, done_map):
         if tk in done_map:
             cache[m] = done_map[tk]
             continue
-        max_t = 64 if m in ["1_Zero_Shot", "2_Few_Shot"] else 512
-        prompt = make_prompt(row, m, lang)
-        raw, ti, to, lat, kn = ask_llm(pool, cfg["id"], prompt, 0.0, max_tok=max_t)
-        pred, conf = parse_output(raw, q_type)
-        rec = make_record(row, m_key, m, lang, pred, conf, 100.0, ti, to, lat, kn, raw)
+        rec = run_single(row, m_key, m, lang, pool)
         cache[m] = rec
         group_res.append(rec)
 
@@ -417,73 +476,76 @@ def eval_group(row, m_key, lang, pool, done_map):
     if tk_sc not in done_map:
         prompt_sc = make_prompt(row, "5_Self_Consistency", lang)
         ans_list, conf_list, logs = [], [], []
-        tok_in, tok_out, lat, k_num = 0, 0, 0.0, 1
+        agg = {"text": "", "tok_in": 0, "tok_out": 0, "tok_think": 0, "lat": 0.0, "key": 1, "finish": "STOP"}
+        n_trunc = 0
 
         z_cot = cache.get("3_Zero_Shot_CoT")
-        if z_cot and z_cot["Predicted"] != "API_ERR" and z_cot["Predicted"] != "":
-            p0 = str(z_cot["Predicted"])
-            c0 = float(z_cot["Confidence"])
-            ans_list.append(p0)
-            conf_list.append(c0)
-            logs.append(f"[Run 1 (Reused Z-CoT) | Ans:{p0}]\n{z_cot['Raw_Output']}")
-            tok_in += int(z_cot["Prompt_Tokens"])
-            tok_out += int(z_cot["Comp_Tokens"])
-            lat += float(z_cot["Latency_s"])
-            k_num = int(z_cot["Key_ID"])
+        if SC_REUSE_ZCOT and z_cot and z_cot.get("Status") == "OK":
+            ans_list.append(str(z_cot["Predicted"]))
+            if pd.notna(z_cot.get("Confidence")):
+                conf_list.append(float(z_cot["Confidence"]))
+            logs.append(f"[Run 1 (Reused Z-CoT) | Ans:{z_cot['Predicted']}]\n{z_cot['Raw_Output']}")
+            agg["tok_in"] += int(z_cot["Prompt_Tokens"])
+            agg["tok_out"] += int(z_cot["Comp_Tokens"])
+            agg["tok_think"] += int(z_cot.get("Thought_Tokens", 0) or 0)
+            agg["lat"] += float(z_cot["Latency_s"])
 
+        api_failed = False
         while len(logs) < SC_RUNS:
-            r_txt, ti, to, l_s, kn = ask_llm(pool, cfg["id"], prompt_sc, 0.7, max_tok=512)
-            k_num = kn
-            pa, cf = parse_output(r_txt, q_type)
-            if pa == "API_ERR":
-                logs.append(f"[Run {len(logs)+1} | Key#{kn} | Ans:API_ERR]\n{r_txt}")
+            r = ask_llm(pool, cfg["id"], prompt_sc, 0.7, max_tok=MAX_TOK_COT)
+            agg["key"] = r["key"]
+            pa, cf, st = parse_output(r["text"], q_type, r["finish"])
+            if st == "API_ERR":
+                api_failed = True
+                logs.append(f"[Run {len(logs)+1} | Key#{r['key']} | API_ERR]\n{r['text']}")
                 break
-            if pa:
+            # Chi luong co dap an hop le moi duoc bo phieu
+            if st == "OK":
                 ans_list.append(pa)
-                conf_list.append(cf)
-            logs.append(f"[Run {len(logs)+1} | Key#{kn} | Ans:{pa}]\n{r_txt}")
-            tok_in += ti
-            tok_out += to
-            lat += l_s
+                if cf is not None:
+                    conf_list.append(cf)
+            elif st == "TRUNCATED":
+                n_trunc += 1
+            logs.append(f"[Run {len(logs)+1} | Key#{r['key']} | {st} | Ans:{pa}]\n{r['text']}")
+            for k in ("tok_in", "tok_out", "tok_think"):
+                agg[k] += r[k]
+            agg["lat"] += r["lat"]
 
             if ans_list:
-                top_ans, top_cnt = Counter(ans_list).most_common(1)[0]
-                if top_cnt >= 3:
-                    runs_done = len(logs)
-                    scale = SC_RUNS / runs_done
-                    tok_in = int(round(tok_in * scale))
-                    tok_out = int(round(tok_out * scale))
-                    lat = round(lat * scale, 3)
+                top_cnt = Counter(ans_list).most_common(1)[0][1]
+                if top_cnt >= 3:  # da du da so tuyet doi 3/5 -> dung som
                     break
 
-        if ans_list:
-            # Bau cu 3 tang: So phieu -> Tong do tu tin -> Uu tien Luong 1 (T=0)
+        runs_done = len([x for x in logs if "API_ERR" not in x.split("\n", 1)[0]])
+        if ans_list and not api_failed:
             vote_counts = Counter(ans_list)
-            conf_sums = {a: sum(cf for x, cf in zip(ans_list, conf_list) if x == a) for a in vote_counts}
-            pred_sc = max(vote_counts.keys(), key=lambda a: (vote_counts[a], conf_sums[a]))
-            cnt_sc = vote_counts[pred_sc]
-            agree_sc = round((cnt_sc / len(ans_list)) * 100, 1)
+            pred_sc = vote_counts.most_common(1)[0][0]
+            # hoa phieu -> uu tien dap an xuat hien truoc (Counter giu thu tu xuat hien)
+            agree_sc = round(vote_counts[pred_sc] / len(ans_list) * 100, 1)
+            status_sc = "OK"
+        elif api_failed:
+            pred_sc, agree_sc, status_sc = "API_ERR", None, "API_ERR"
         else:
-            pred_sc, agree_sc = "API_ERR", 0.0
-        conf_sc = round(sum(conf_list) / len(conf_list), 1) if conf_list else 0.0
-        raw_sc = "\n\n".join(logs)
-        rec_sc = make_record(row, m_key, "5_Self_Consistency", lang, pred_sc, conf_sc, agree_sc, tok_in, tok_out, lat, k_num, raw_sc)
+            pred_sc, agree_sc = "", None
+            status_sc = "TRUNCATED" if n_trunc else "NO_ANSWER"
+        conf_sc = round(sum(conf_list) / len(conf_list), 1) if conf_list else None
+        agg["text"] = "\n\n".join(logs)
+        agg["finish"] = f"runs={runs_done},truncated={n_trunc}"
+        # Token/latency la THUC TE da dung (khong nhan ti le nua); so luong chay ghi o SC_Runs
+        rec_sc = make_record(row, m_key, "5_Self_Consistency", lang, pred_sc, conf_sc, agree_sc, agg, status_sc, runs_done)
         group_res.append(rec_sc)
 
     tk_lk = f"{q_id}_{m_key}_{lang}_6_Few_Shot_CoT_Leaked"
     if tk_lk not in done_map:
         f_cot = cache.get("4_Few_Shot_CoT")
-        if leak_grp == "Khong_Lo_Unleaked" and f_cot and f_cot["Predicted"] != "API_ERR":
+        if leak_grp == "Khong_Lo_Unleaked" and f_cot and f_cot.get("Status") != "API_ERR":
+            # Cau khong co nhom leak -> prompt giong het Few-shot CoT, dung lai ket qua
             rec_lk = dict(f_cot)
             rec_lk["Task_Key"] = tk_lk
             rec_lk["Method"] = "6_Few_Shot_CoT_Leaked"
             group_res.append(rec_lk)
         else:
-            prompt_lk = make_prompt(row, "6_Few_Shot_CoT_Leaked", lang)
-            raw_lk, ti, to, lat, kn = ask_llm(pool, cfg["id"], prompt_lk, 0.0, max_tok=512)
-            pred_lk, conf_lk = parse_output(raw_lk, q_type)
-            rec_lk = make_record(row, m_key, "6_Few_Shot_CoT_Leaked", lang, pred_lk, conf_lk, 100.0, ti, to, lat, kn, raw_lk)
-            group_res.append(rec_lk)
+            group_res.append(run_single(row, m_key, "6_Few_Shot_CoT_Leaked", lang, pool))
 
     return group_res
 
