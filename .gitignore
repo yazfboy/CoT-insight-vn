@@ -2,3 +2,5 @@
 .venv/
 __pycache__/
 ~$*.xlsx
+# Output thô khi chạy lại Qwen Gói 3 (không commit)
+benchmark_output_qwen_v2/

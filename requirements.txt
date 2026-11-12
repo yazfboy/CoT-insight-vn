@@ -1,4 +1,5 @@
 google-genai
+requests
 pandas
 openpyxl
 tqdm
