@@ -219,29 +219,54 @@ def is_numeric_question(case_or_type: dict[str, Any] | str) -> bool:
     return "nguyên" in value or "integer" in value or value.strip().lower() in {"number", "numeric"}
 
 
+# --- Parse đáp án: đồng bộ với benchmark/run_benchmark.parse_output ---
+# Lỗi cũ: thiếu tag thì lấy luôn DÒNG CUỐI. Model nhỏ (Qwen) hay ghi đáp án trần rồi mới tới
+# "[Confidence]: 100%" -> dòng cuối là dòng độ tự tin -> câu số bị lấy nhầm "100" làm đáp án.
+# Ngoài ra câu số lấy số ĐẦU dòng (benchmark lấy số CUỐI) -> hai nơi chấm khác nhau.
+ANS_TAG_RE = re.compile(
+    r"(?:Đáp\s+án\s+cuối\s+cùng|Final\s+Answer)\s*\]?\s*\**\s*[:：]\s*\**\s*([^\r\n]*)", re.IGNORECASE)
+BARE_ANS_RE = re.compile(r"^\W*(?:(?:đáp án|answer)\s*[:：]?\s*)?(-?[\d.,]+|[A-D])\W*$", re.IGNORECASE)
+CONF_LINE_RE = re.compile(
+    r"^\W*(?:\[?\s*(?:độ\s*tự\s*tin|confidence)\s*\]?\s*\**\s*[:：]?)?\s*\**\s*(\d{1,3}(?:[.,]\d+)?)\s*%\W*$",
+    re.IGNORECASE)
+CONF_WORD_RE = re.compile(r"độ\s*tự\s*tin|confidence", re.IGNORECASE)
+
+
+def _strip_trailing_conf(lines: list[str]) -> tuple[list[str], float | None]:
+    """Bỏ 1 dòng độ tự tin ở CUỐI nếu dòng đó có tag, hoặc ngay trước nó là dòng chỉ chứa
+    đáp án (vd "B" rồi "80%"). Trả (các dòng còn lại, confidence hoặc None)."""
+    if not lines:
+        return lines, None
+    m = CONF_LINE_RE.match(lines[-1])
+    if m and (CONF_WORD_RE.search(lines[-1]) or (len(lines) > 1 and BARE_ANS_RE.match(lines[-2]))):
+        return lines[:-1], float(m.group(1).replace(",", "."))
+    return lines, None
+
+
 def extract_final_line(text: str) -> str:
-    matches = re.findall(
-        r"(?:\[\s*(?:Final\s+Answer|Đáp\s+án\s+cuối\s+cùng)\s*\]|(?:Final\s+Answer|Đáp\s+án\s+cuối\s+cùng))\s*[:：]\s*([^\r\n]+)",
-        text or "",
-        re.IGNORECASE,
-    )
-    if matches:
-        return matches[-1].strip()
+    """Phần chứa đáp án cuối: nội dung sau tag [Final Answer]/[Đáp án cuối cùng] cuối cùng; nếu
+    không có (hoặc tag trống) thì dòng cuối CHỈ chứa đáp án, sau khi bỏ 1 dòng độ tự tin ở cuối.
+    Trả "" nếu không tìm thấy — không đoán từ câu văn để tránh bắt nhầm số trung gian."""
+    tags = ANS_TAG_RE.findall(text or "")
+    if tags and tags[-1].strip(" *"):
+        return tags[-1].strip(" *")
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+    body, _ = _strip_trailing_conf(lines)
+    if body and BARE_ANS_RE.match(body[-1]):
+        return body[-1]
+    return ""
 
 
 def normalize_answer(text: str, category: str) -> str | None:
     final = extract_final_line(text)
+    if not final:
+        return None
     if is_numeric_question(category):
-        return norm_numeric(final)
+        s = re.sub(r"(?<=\d)[.,](?=\d{3}\b)", "", final)  # bỏ dấu phân cách hàng nghìn: 1,200
+        nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+        return norm_numeric(nums[-1]) if nums else None   # số CUỐI, giống benchmark
     m = re.search(r"\b([A-D])\b", final.upper())
-    if m:
-        return m.group(1)
-    # A response may put the choice label in its final line without brackets.
-    if re.fullmatch(r"\(?\s*[A-D]\s*\)?[.)]??", final.upper()):
-        return final.strip(" ()).")
-    return None
+    return m.group(1) if m else None
 
 
 def normalize_ground_truth(value: str, category: str) -> str | None:
@@ -253,12 +278,17 @@ def normalize_ground_truth(value: str, category: str) -> str | None:
 
 def parse_confidence(text: str) -> float:
     matches = re.findall(r"(?:\[\s*(?:Confidence|Độ\s*tự\s*tin)\s*\]|(?:Confidence|Độ\s*tự\s*tin))\s*[:：]\s*(\d+(?:[.,]\d+)?)\s*%?", text or "", re.IGNORECASE)
-    if not matches:
-        return 50.0
-    try:
-        return float(matches[-1].replace(",", "."))
-    except ValueError:
-        return 50.0
+    if matches:
+        try:
+            return float(matches[-1].replace(",", "."))
+        except ValueError:
+            pass
+    # Không có tag: nhận dòng độ tự tin trần ở cuối (vd "B" rồi "80%").
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    _, conf = _strip_trailing_conf(lines)
+    if conf is not None:
+        return min(100.0, max(0.0, conf))
+    return 50.0
 
 
 def logprob_confidence(avg_logprobs: Any) -> float | None:
@@ -280,16 +310,21 @@ def is_correct(predicted: str | None, ground_truth: str, category: str) -> int:
     return int(p is not None and g is not None and p == g)
 
 
-def answer_tail(lang: str) -> str:
+def answer_tail(lang: str, numeric: bool) -> str:
+    """Dòng chốt bắt buộc, THEO ĐÚNG DẠNG CÂU (giống make_prompt của benchmark).
+    Bản cũ ghi chung "một số nguyên hoặc A/B/C/D" -> Qwen 7B trả lời bằng chữ cái cho câu cần
+    đáp số (17/50 lượt) và bị chấm sai."""
     if lang == "VI":
-        return "BẮT BUỘC kết thúc bằng đúng 2 dòng:\n[Đáp án cuối cùng]: <một số nguyên hoặc A/B/C/D>\n[Độ tự tin]: <0-100>%"
-    return "MUST end with exactly these 2 lines:\n[Final Answer]: <one integer or A/B/C/D>\n[Confidence]: <0-100>%"
+        rule = "một số nguyên duy nhất" if numeric else "một chữ cái (A, B, C hoặc D)"
+        return f"BẮT BUỘC kết thúc bằng đúng 2 dòng:\n[Đáp án cuối cùng]: <chỉ ghi {rule}>\n[Độ tự tin]: <0-100>%"
+    rule = "a single integer" if numeric else "a single letter (A, B, C, or D)"
+    return f"MUST end with exactly these 2 lines:\n[Final Answer]: <{rule}>\n[Confidence]: <0-100>%"
 
 
 def make_prompt(case: dict[str, Any], method: str) -> str:
     q = case["question"]
     lang = case["language"]
-    tail = answer_tail(lang)
+    tail = answer_tail(lang, is_numeric_question(case))
     if method == "Premise_Extraction":
         if lang == "VI":
             return f"Trích xuất 2-5 tiền đề nêu rõ trong đề; phân biệt dữ kiện liên quan và không liên quan; ghi điều đề hỏi. Không tự thêm dữ kiện. Suy luận ngắn, kiểm tra đơn vị/phép tính, rồi chốt.\n\nĐề bài:\n{q}\n\n{tail}"
@@ -319,14 +354,14 @@ def make_nli_prompt(case: dict[str, Any]) -> str:
     candidate = case["baseline_raw"]
     if len(candidate) > 12000:
         candidate = candidate[:10000] + "\n...[truncated candidate for checker input]...\n" + candidate[-2000:]
-    return f"{intro}\n\n{qlabel}:\n{case['question']}\n\n{clabel}:\n{candidate}\n\n{answer_tail(case['language'])}"
+    return f"{intro}\n\n{qlabel}:\n{case['question']}\n\n{clabel}:\n{candidate}\n\n{answer_tail(case['language'], is_numeric_question(case))}"
 
 
 def make_retry_prompt(case: dict[str, Any], method: str) -> str:
     """Short-format retry prompts for outputs that were truncated or unparsable."""
     q = case["question"]
     lang = case["language"]
-    tail = answer_tail(lang)
+    tail = answer_tail(lang, is_numeric_question(case))
     if method == "PAL":
         if lang == "VI":
             return f"Chỉ giải bài toán bằng một biểu thức số học Python. Dùng hằng số và + - * / // % **; chỉ viết JSON một dòng đúng dạng {{\"code\":\"print(biểu_thức)\",\"confidence\":70}}. Không markdown, không giải thích, không biến/import/hàm khác. Câu hỏi: {q}"
@@ -354,7 +389,7 @@ def make_retry_prompt(case: dict[str, Any], method: str) -> str:
 def make_retry3_prompt(case: dict[str, Any], method: str) -> str:
     q = case["question"]
     lang = case["language"]
-    tail = answer_tail(lang)
+    tail = answer_tail(lang, is_numeric_question(case))
     if method == "Premise_Extraction":
         if lang == "VI":
             return f"Chỉ xuất 3 dòng ngắn: Tiền đề liên quan: ... / Quan hệ: ... / Kết quả: ... . Không thêm bình luận.\nĐề: {q}\n{tail}"
@@ -686,8 +721,9 @@ def calibrate_temperature_and_confidence(
 
 def make_calibration_prompt(question: str, lang: str, category: str) -> str:
     if lang == "VI":
-        return f"Trả lời trực tiếp, không giải thích. Nếu thiếu dữ kiện thì chọn phương án phù hợp theo đề. Tự nêu confidence trung thực.\nCâu hỏi: {question}\n\n[Đáp án cuối cùng]: <số nguyên hoặc A/B/C/D>\n[Độ tự tin]: <0-100>%"
-    return f"Answer directly without explanation. If the question is underspecified, choose based only on the prompt. Report confidence honestly.\nQuestion: {question}\n\n[Final Answer]: <integer or A/B/C/D>\n[Confidence]: <0-100>%"
+        # Dòng chốt theo đúng dạng câu (xem answer_tail).
+        return f"Trả lời trực tiếp, không giải thích. Nếu thiếu dữ kiện thì chọn phương án phù hợp theo đề. Tự nêu confidence trung thực.\nCâu hỏi: {question}\n\n{answer_tail(lang, is_numeric_question(category))}"
+    return f"Answer directly without explanation. If the question is underspecified, choose based only on the prompt. Report confidence honestly.\nQuestion: {question}\n\n{answer_tail(lang, is_numeric_question(category))}"
 
 
 def expected_calibration_error(values: list[dict[str, Any]]) -> float:

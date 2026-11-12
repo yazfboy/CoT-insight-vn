@@ -32,17 +32,18 @@ python benchmark/run_benchmark.py
 
 ### Thành phần chính trong `run_benchmark.py`
 - **KeyPool**: xoay tua nhiều API key từ `.env`, giãn cách request để tránh lỗi 429, khoá key khi hết hạn mức ngày.
-- **MODELS**: 2 mô hình đối sánh:
+- **MODELS**: 3 mô hình đối sánh (2 qua API Google trong `run_benchmark.py`, 1 tự host):
   - `Small` → **gemma-4-26b-a4b-it** (thinking `minimal`)
   - `Large` → **gemini-3.5-flash-lite**
+  - `Qwen_7B` → **qwen2.5:7b**, tự host (vLLM/Ollama), chạy bằng `benchmark/run_extra_llm.py`
 - **make_prompt**: tạo prompt cho 6 phương pháp (`1_Zero_Shot`, `2_Few_Shot`, `3_Zero_Shot_CoT`, `4_Few_Shot_CoT`, `5_Self_Consistency`, `6_Few_Shot_CoT_Leaked`).
 - **parse_output & is_match**: tách `[Đáp án cuối cùng]` + `[Độ tự tin]` bằng regex, đối chiếu đáp án gốc để chấm 1/0.
 
 ### 5 sheet trong file Excel kết quả
-1. **1_Raw_Logs** — log chi tiết từng lượt (3600 dòng: 150 × 2 model × 2 ngôn ngữ × 6 phương pháp).
+1. **1_Raw_Logs** — log chi tiết từng lượt. File mới nhất `20261110_232749` có 5400 dòng (150 × 3 model × 2 ngôn ngữ × 6 phương pháp); file `20261106_095454` có 3600 dòng (2 model).
 2. **2_Summary** — % Accuracy, token, thời gian, chi phí, độ tự tin theo model × ngôn ngữ × phương pháp × độ khó.
 3. **3_Leak_Compare** — so sánh `4_Few_Shot_CoT` (sạch) vs `6_Few_Shot_CoT_Leaked` (rò rỉ).
-4. **4_Errors** — các câu CoT sai (Correct == 0) + cột trống để phân tích lỗi thủ công.
+4. **4_Errors** — mọi câu trả lời sai (Correct == 0) của cả 6 phương pháp + cột trống để phân tích lỗi thủ công.
 5. **5_Faithfulness_Matrix** — thống kê nhãn faithfulness (1→1 / 0→1 / 1→0 / 0→0) + độ tự tin trung bình.
 
 ## 4. Chạy web app (Gói 4)

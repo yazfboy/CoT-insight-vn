@@ -1,8 +1,8 @@
 """Tab 3 - Khi CoT sai: sai thế nào? (CH2 + CH3 + phân loại lỗi).
 
-Kết luận: Zero-Shot sai mà vẫn tự tin ~99.5; CoT kéo xuống ~92 nhưng chưa khắc phục
-hẳn (76% câu sai vẫn ≥90). Model gần như không có ca 1→0 (nghĩ đúng chốt sai);
-lỗi nằm gần như toàn bộ ở bước suy luận.
+Kết luận: Zero-Shot sai mà vẫn rất tự tin; CoT kéo độ tự tin lúc sai xuống nhưng chưa
+khắc phục hẳn (phần lớn câu sai vẫn ≥90). Ca 1→0 (nghĩ đúng chốt sai) rất hiếm;
+lỗi nằm gần như toàn bộ ở bước suy luận. Các con số hiển thị tính từ dữ liệu.
 
 Bố cục mỗi khối: khẳng định -> biểu đồ -> "Đọc" -> "Kết luận".
 Nguồn: 1_Raw_Logs, 5_Faithfulness_Matrix, 4_Errors; Error_Type từ Baselines (Gói 3).
@@ -20,13 +20,29 @@ def render(ctx):
 
     # --- CH2: overconfidence ---
     st.markdown("**1. CH2 — CoT có làm model 'sai một cách tự tin' không?**")
-    st.markdown("*Biểu đồ hộp (box plot) — phân bố độ tự tin trên các câu SAI theo phương pháp.*")
+    st.markdown("*Biểu đồ hộp (box plot) — phân bố độ tự tin trên các câu SAI theo phương pháp, "
+                "tách theo model.*")
     st.plotly_chart(charts.confidence_on_wrong(raw), width="stretch")
-    st.caption("Đọc: mỗi điểm là một câu **trả lời sai** (jitter ngang cho khỏi chồng); hộp "
-               "tóm tắt tứ phân vị. Đường đỏ = ngưỡng 90. Zero-Shot gần như toàn bộ điểm dồn "
-               "ở 100 (hộp dẹt ở đỉnh) → luôn cực tự tin dù sai; Zero-CoT trải xuống thấp hơn.")
-    st.success("**Kết luận:** CoT *giảm* sự mù quáng — độ tự tin trung bình lúc sai từ ~99.5 "
-               "xuống ~92 — nhưng chưa chữa khỏi: vẫn ~76% câu sai được chấm ≥90.")
+    w = raw[(raw["Correct"] == 0) & (raw["Confidence"].notna())]
+    stats = {}   # model -> (tự tin TB ZS, CoT, %≥90 ZS, CoT)
+    for m in charts._models(w):
+        wz = w[(w["Model"] == m) & (w["Method"] == "1_Zero_Shot")]["Confidence"]
+        wc = w[(w["Model"] == m) & (w["Method"] == "3_Zero_Shot_CoT")]["Confidence"]
+        if len(wz) and len(wc):
+            stats[m] = (wz.mean(), wc.mean(), (wz >= 90).mean() * 100, (wc >= 90).mean() * 100)
+    down = [m for m, v in stats.items() if v[3] < v[2] - 5]      # CoT giảm rõ tỷ lệ ≥90
+    other = [m for m in stats if m not in down]
+    st.caption("Đọc: mỗi panel là một model; mỗi điểm là một câu **trả lời sai** (jitter ngang "
+               "cho khỏi chồng), hộp tóm tắt tứ phân vị. Đường đỏ = ngưỡng 90; dưới trục ghi % "
+               "câu sai vẫn tự tin ≥90 và số câu sai (n).")
+    parts = [f"{m}: {v[2]:.0f}% → {v[3]:.0f}% câu sai ≥90" for m, v in stats.items()]
+    msg = "**Kết luận:** "
+    if down:
+        msg += (f"ở {'/'.join(down)}, CoT *giảm* rõ sự mù quáng nhưng chưa chữa khỏi")
+    if other:
+        msg += ("; " if down else "") + f"ở {'/'.join(other)} thì CoT **không** giảm"
+    msg += " (" + "; ".join(parts) + ")."
+    st.success(msg)
 
     # --- CH3: faithfulness ---
     st.markdown("**2. CH3 — Lời giải từng bước có khớp với đáp án cuối không?**")
@@ -34,24 +50,37 @@ def render(ctx):
     st.plotly_chart(charts.faithfulness_matrix(data.faithfulness(path)), width="stretch")
     st.caption("Đọc: 4 ô = (lập luận đúng/sai) × (đáp án cuối đúng/sai). Ô **1→0** là trường "
                "hợp 'nghĩ đúng nhưng chốt sai' — đáng lo nhất, và ở đây rất nhỏ.")
-    st.success("**Kết luận:** gần như không có ca 1→0 → model hiếm khi phản bội chính lời "
-               "giải của nó; sai chủ yếu vì *suy luận sai* (0→0), không phải vì lệch khâu chốt.")
+    fm = data.faithfulness(path)
+    n10 = int(fm[fm["Faithfulness"] == "1->0"]["Count"].sum())
+    n_all = int(fm["Count"].sum())
+    st.success(f"**Kết luận:** chỉ {n10}/{n_all} lượt CoT rơi vào ô 1→0 → model hiếm khi phản bội "
+               "chính lời giải của nó; sai chủ yếu vì *suy luận sai* (0→0), không phải vì lệch "
+               "khâu chốt.")
 
     # --- Phân loại lỗi 20 ca ---
     st.markdown("**3. 20 câu sai tiêu biểu sai vì kiểu lỗi gì?**")
     st.markdown("*Biểu đồ cột nhóm — số ca theo kiểu lỗi × model.*")
     st.plotly_chart(charts.error_type_breakdown(data.evidence_baselines()), width="stretch")
-    st.caption("Đọc: đếm theo nhãn lỗi do người gắn, tách theo model.")
+    st.caption("Đọc: đếm theo nhãn lỗi do người gắn, tách theo model. Phạm vi: 20 ca sai được "
+               "chọn từ Small/Large (Gói 3).")
     st.success("**Kết luận:** lỗi *hiểu sai đề* (Misinterpretation) và *làm dở dang* "
                "(Incomplete) chiếm đa số — không phải lỗi số học thuần.")
 
     # --- Bảng tra lỗi ---
     st.markdown("**4. Tra cứu từng câu sai** (yêu cầu bắt buộc: phân tích ≥20 câu sai).")
-    st.markdown("*Bảng — danh sách câu CoT trả lời sai, kèm trích lời giải rút gọn.*")
+    st.markdown("*Bảng — mọi câu trả lời sai của cả 6 phương pháp (sheet 4_Errors); chọn một "
+                "câu bên dưới để xem lời giải.*")
     err = data.errors(path).reset_index(drop=True)
-    methods = st.multiselect("Lọc theo phương pháp",
+    f1, f2 = st.columns(2)
+    methods = f1.multiselect("Lọc theo phương pháp",
                              sorted(err["Method"].unique()), default=[], key="t3_method")
-    view = (err[err["Method"].isin(methods)] if methods else err).reset_index(drop=True)
+    mdl = f2.multiselect("Lọc theo model", charts._models(err), default=[], key="t3_model")
+    view = err
+    if methods:
+        view = view[view["Method"].isin(methods)]
+    if mdl:
+        view = view[view["Model"].isin(mdl)]
+    view = view.reset_index(drop=True)
 
     disp = pd.DataFrame({
         "ID": view["ID"],
@@ -71,7 +100,8 @@ def render(ctx):
                 format="%d", help="Độ tự tin model tự báo (0–100)"),
         },
     )
-    st.caption(f"{len(view)} câu CoT sai. Chọn một câu để xem lời giải đầy đủ:")
+    st.caption(f"{len(view)} câu trả lời sai. Lọc theo phương pháp/model ở trên; chọn một câu "
+               "để xem lời giải đầy đủ:")
 
     # Xem chi tiết một câu (lời giải đầy đủ, giữ xuống dòng cho dễ đọc).
     labels = [f"{r.ID} · {charts.METHOD_SHORT.get(r.Method, r.Method)} · "

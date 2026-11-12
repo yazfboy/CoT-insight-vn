@@ -4,7 +4,8 @@ Chạy:  streamlit run app/main.py
 Cấu trúc: main.py (khung + màn mở đầu) -> data.py -> charts.py -> tabs/.
 
 Thiết kế theo góc nhìn LLM researcher: ưu tiên trực quan hoá + giải thích, so sánh
-Small/Large và VI/EN song song. Không có bộ lọc chung; tự lấy file kết quả mới nhất.
+các model (Small/Large/Qwen_7B) và VI/EN song song. Không có bộ lọc chung; tự lấy file
+kết quả mới nhất.
 
 4 Tab tương ứng các câu hỏi nghiên cứu trong PROJECT.md:
   Tab 1 Thử ngay          - mở đầu, live demo
@@ -41,6 +42,8 @@ st.caption(
     f"**{info['n_tasks']} lượt gọi**"
     + (f" · chạy {info['run_date']}" if info['run_date'] else "")
 )
+st.caption("Mô hình: **Small** = gemma-4-26b-a4b-it · **Large** = gemini-3.5-flash-lite "
+           "(API Google) · **Qwen_7B** = qwen2.5:7b (tự host, Ollama). Nhãn ngắn dùng xuyên biểu đồ.")
 
 hs = data.headline_stats(path)
 style.section_label("Năm phát hiện chính")

@@ -9,6 +9,8 @@ import streamlit as st
 from .. import data, charts, llm
 
 SHORTS = [charts.METHOD_SHORT[m] for m in charts.METHOD_ORDER]
+# Model gọi live được qua benchmark/run_benchmark.py (Qwen_7B tự host -> chỉ phát lại).
+LIVE_MODELS = {"Small", "Large"}
 SHORT2KEY = {charts.METHOD_SHORT[m]: m for m in charts.METHOD_ORDER}
 
 
@@ -21,7 +23,15 @@ def _card(c, method_key, rec, live):
     pred = rec.get("Predicted", "")
     correct = rec.get("Correct")
     mark = "✅" if correct == 1 else ("❌" if correct == 0 else "")
-    c.markdown(f"Đáp án: **{pred}** {mark}")
+    if pred is None or (isinstance(pred, float) and pd.isna(pred)) or str(pred).strip() == "":
+        status = rec.get("Status") or "NO_ANSWER"
+        c.markdown(f"Đáp án: *không trích được* {mark}")
+        why = {"TRUNCATED": "câu trả lời bị cắt vì hết giới hạn token",
+               "NO_ANSWER": "model không ghi đúng dòng đáp án cuối",
+               "API_ERR": "lỗi gọi API"}.get(str(status), "không đọc được đáp án")
+        c.caption(f"Trạng thái: `{status}` ({why})")
+    else:
+        c.markdown(f"Đáp án: **{pred}** {mark}")
     conf = rec.get("Confidence")
     tok = rec.get("Total_Tokens") or 0
     lat = rec.get("Latency_s")
@@ -64,8 +74,13 @@ def render(ctx):
     src = st.radio("Nguồn câu hỏi", ["Chọn từ 150 câu", "Tự nhập câu mới"],
                    horizontal=True, key="t1_src")
     col_m, col_l = st.columns(2)
-    model = col_m.radio("Mô hình", ["Small", "Large"], horizontal=True, key="t1_model")
+    # Danh sách model lấy từ file kết quả; chỉ model có trong run_benchmark mới gọi live được.
+    models = charts._models(data.raw_logs(path))
+    model = col_m.radio("Mô hình", models, horizontal=True, key="t1_model")
     lang = col_l.radio("Ngôn ngữ", ["VI", "EN"], horizontal=True, key="t1_lang")
+    can_live = model in LIVE_MODELS
+    if not can_live:
+        col_m.caption(f"{model} chạy trên server tự host → chỉ **phát lại** kết quả đã lưu.")
     picked = st.multiselect("Phương pháp (so sánh song song)", SHORTS,
                             default=["Zero-Shot", "Zero-CoT", "Self-Consist"], key="t1_meth")
     sel = [m for m in charts.METHOD_ORDER if charts.METHOD_SHORT[m] in picked]
@@ -95,8 +110,11 @@ def render(ctx):
     b1, b2 = st.columns(2)
     do_replay = b2.button("Phát lại kết quả đã lưu", disabled=custom or not sel,
                           width="stretch", key="t1_replay")
-    do_live = b1.button("Gọi API thật", type="primary", disabled=not sel,
+    do_live = b1.button("Gọi API thật", type="primary", disabled=(not sel) or (not can_live),
                         width="stretch", key="t1_live_btn")
+    if custom and not can_live:
+        st.warning(f"Câu tự nhập cần gọi API thật, mà {model} không hỗ trợ live — "
+                   "hãy chọn Small hoặc Large.")
 
     if do_replay and not custom:
         recs = {k: data.raw_lookup(path, row["ID"], model, lang, k) for k in sel}

@@ -23,10 +23,13 @@ FIX_LIST = ["Premise", "Strict CoT", "PAL", "NLI", "Calibration"]
 
 def render(ctx):
     st.subheader("Có sửa được những câu CoT làm sai không?")
+    st.caption("Phạm vi: mục 1–3 và phần demo dùng 20 ca sai được chọn từ **Small/Large**. "
+               "Mục 4 chạy cùng 5 can thiệp đó với **Qwen 7B** trên chính 20 câu này.")
     tab_a, tab_b = st.tabs(["A. Kết quả đã chạy", "B. Bật/tắt trực tiếp (demo)"])
 
     with tab_a:
         st.markdown("**1. Mỗi can thiệp cứu được bao nhiêu trong 20 ca sai?**")
+        st.markdown("*Biểu đồ cột — tỷ lệ sửa được (%) theo can thiệp.*")
         st.plotly_chart(charts.fix_rate_by_method(data.evidence_fix()), width="stretch")
         st.caption("Đọc: nhãn trên cột là *số ca sửa được / số ca áp dụng được*. PAL chỉ chạy "
                    "trên 10 câu số (10 câu trắc nghiệm bị bỏ qua) nên mẫu số là 10.")
@@ -43,12 +46,15 @@ def render(ctx):
                    "can thiệp phù hợp riêng, gợi ý nên phối hợp thay vì dùng một kỹ thuật duy nhất.")
 
         st.markdown("**3. Hiệu chỉnh độ tự tin có đáng không?**")
+        st.markdown("*Biểu đồ cột đôi — Brier score và độ tự tin trung bình, trước vs sau hiệu chỉnh.*")
         st.plotly_chart(charts.calibration_bars(data.calibration_before_after()),
                         width="stretch")
         st.caption("Đọc: Brier càng thấp càng tốt (độ tự tin khớp thực tế hơn); độ tự tin "
                    "trung bình kéo từ ~97 xuống ~87 trên tập 20 ca vốn sai.")
         st.success("**Kết luận:** hiệu chỉnh nhiệt độ + calibration cải thiện mạnh độ tin cậy "
-                   "của điểm tự tin (Brier 0.945 → 0.247) dù accuracy chỉ nhích nhẹ.")
+                   "của điểm tự tin (Brier 0.945 → 0.247), đồng thời lật được 13/20 ca thành đúng.")
+
+        _render_qwen()
 
         with st.expander("Giải thích & giới hạn"):
             st.markdown(
@@ -63,6 +69,55 @@ def render(ctx):
 
     with tab_b:
         _render_demo()
+
+
+def _render_qwen():
+    """Mục 4: cùng 5 can thiệp chạy với Qwen 7B trên chính 20 câu đã chọn.
+
+    Dữ liệu từ analysis/qwen_goi3_rerun.xlsx — bản chạy lại SẠCH (prompt theo đúng dạng câu,
+    parser đã sửa; 0 lượt câu số bị trả lời chữ cái; baseline 8/20)."""
+    qm = data.qwen_rerun()
+    if qm is None or qm.empty:
+        st.caption("Chưa có dữ liệu Gói 3 của Qwen (analysis/qwen_goi3_rerun.xlsx).")
+        return
+    q = qm.copy()
+    q["M"] = q["Phương pháp"].map(charts.FIX_SHORT).fillna(q["Phương pháp"])
+    q["net"] = q["Accuracy sau (%)"] - q["Accuracy trước (%)"]
+    base_ok = int(q["Đúng trước"].max())
+    base_n = int(q["N hợp lệ"].max())
+    # Hoà điểm -> ưu tiên N lớn hơn (PAL chỉ 10 câu số), rồi ít regression hơn.
+    best = q.sort_values(["net", "N hợp lệ", "Regression"],
+                         ascending=[False, False, True]).iloc[0]
+    worst = q.sort_values(["net", "N hợp lệ"], ascending=[True, False]).iloc[0]
+    tot_fix, tot_reg = int(q["Sửa được"].sum()), int(q["Regression"].sum())
+    helped = q[q["net"] > 0]["M"].tolist()
+    hurt = q[q["net"] < 0]["M"].tolist()
+    safe = q[(q["net"] > 0) & (q["Regression"] == 0)]["M"].tolist()  # có lãi mà 0 regression
+
+    st.markdown("**4. Còn với model yếu (Qwen 7B) thì sao?**")
+    st.markdown("*Biểu đồ cột phân kỳ — số ca sai→đúng (lên) và đúng→sai (xuống) theo can "
+                "thiệp, kèm mức thay đổi ròng.*")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Qwen baseline trên 20 câu", f"{base_ok}/{base_n}",
+              f"{base_ok / base_n * 100:.0f}% đã đúng sẵn", delta_color="off")
+    c2.metric(f"Tốt nhất: {best['M']}", f"{best['Accuracy sau (%)']:.0f}%",
+              f"{best['net']:+.0f} điểm")
+    c3.metric(f"Tệ nhất: {worst['M']}", f"{worst['Accuracy sau (%)']:.0f}%",
+              f"{worst['net']:+.0f} điểm")
+    st.plotly_chart(charts.qwen_fix_regression(qm), width="stretch")
+    st.caption("Đọc: cột xanh = số ca Qwen vốn sai được lật thành đúng; cột đỏ = số ca vốn "
+               "đúng bị can thiệp làm **sai đi** (regression); hình thoi = ròng, nhãn ghi thay "
+               f"đổi accuracy. Khác mục 1: 20 câu này chọn từ lỗi của Small/Large, nên Qwen đã "
+               f"đúng sẵn {base_ok}/{base_n} câu và can thiệp có thể làm hỏng chúng. PAL chỉ tính "
+               "10 câu số.")
+    st.success(
+        f"**Kết luận:** với Qwen 7B, 5 can thiệp sửa được tổng cộng {tot_fix} ca nhưng làm hỏng "
+        f"{tot_reg} ca — lãi ròng mỏng. Dương ở {', '.join(helped) if helped else 'không kỹ thuật nào'}; "
+        f"âm ở {', '.join(hurt) if hurt else 'không kỹ thuật nào'}. "
+        + (f"Chỉ **{', '.join(safe)}** vừa có lãi vừa không gây regression → an toàn nhất cho "
+           "model yếu. " if safe else "")
+        + "Trái ngược Small/Large (Premise cứu 70%), các kỹ thuật ép thêm bước ít hiệu quả hơn "
+        "trên model yếu vì nó khó làm theo đúng quy trình.")
 
 
 def _is_integer_q(category) -> bool:

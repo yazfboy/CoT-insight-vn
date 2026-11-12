@@ -23,6 +23,7 @@ FIX_SHORT = {
     "Strict CoT": "Strict CoT",
     "PAL": "PAL",
     "Post-generation NLI guardrail": "NLI",
+    "Post-generation NLI Guardrails": "NLI",   # tên dùng trong sheet Qwen_*
     "Logprob & Temperature Calibration": "Calibration",
 }
 FIX_ORDER = ["Premise", "Strict CoT", "PAL", "NLI", "Calibration"]
@@ -49,6 +50,16 @@ DIFF_ORDER = ["Easy", "Medium", "Hard"]
 DIFF_COLORS = {"Easy": "#86b6ef", "Medium": "#3987e5", "Hard": "#184f95"}
 
 _FAMILY_HEX = {"Không CoT": "#898781", "CoT / biến thể": "#2a78d6"}
+
+# Model: thứ tự + màu cố định (validator --pairs all: PASS; aqua <3:1 -> luôn có legend/nhãn).
+MODEL_ORDER = ["Small", "Large", "Qwen_7B"]
+MODEL_COLORS = {"Small": "#eb6834", "Large": "#2a78d6", "Qwen_7B": "#1baf7a"}
+
+
+def _models(df: pd.DataFrame) -> list:
+    """Danh sách model có trong dữ liệu, theo MODEL_ORDER (model lạ xếp cuối)."""
+    present = list(pd.unique(df["Model"]))
+    return [m for m in MODEL_ORDER if m in present] + [m for m in present if m not in MODEL_ORDER]
 
 
 def _rgba(hex_color: str, alpha: float) -> str:
@@ -77,19 +88,20 @@ def _layout(fig: go.Figure, height: int = 380) -> go.Figure:
     return fig
 
 
-# 1) CH1 — accuracy theo phương pháp × độ khó, so sánh 2 model.
+# 1) CH1 — accuracy theo phương pháp × độ khó, so sánh các model (facet).
 def acc_by_method_difficulty(summary_df: pd.DataFrame) -> go.Figure:
     df = _short(summary_df)
     g = (df.groupby(["Model", "M", "Difficulty"], as_index=False)["Acc_Pct"].mean())
     fig = px.bar(
         g, x="M", y="Acc_Pct", color="Difficulty", barmode="group",
         facet_col="Model",
-        category_orders={"M": SHORT_ORDER, "Difficulty": DIFF_ORDER},
+        category_orders={"M": SHORT_ORDER, "Difficulty": DIFF_ORDER,
+                         "Model": _models(g)},
         color_discrete_map=DIFF_COLORS,
     )
     fig.update_yaxes(range=[0, 105], title="Accuracy (%)")
     fig.update_xaxes(title="")
-    # Làm nổi tên 2 model (Small/Large) để thấy rõ đây là trục so sánh.
+    # Làm nổi tên từng model (tên subfigure) để thấy rõ đây là trục so sánh.
     fig.for_each_annotation(lambda a: a.update(
         text="<b>" + a.text.replace("Model=", "Model: ") + "</b>",
         font=dict(size=15, color="#2a78d6")))
@@ -104,18 +116,26 @@ def cost_vs_accuracy(summary_df: pd.DataFrame) -> go.Figure:
     g = g.sort_values("Method")
     fig = px.scatter(
         g, x="Tok", y="Acc", color="M", symbol="Model",
-        category_orders={"M": SHORT_ORDER}, color_discrete_map=METHOD_COLORS,
+        category_orders={"M": SHORT_ORDER, "Model": _models(g)},
+        color_discrete_map=METHOD_COLORS,
     )
     fig.update_traces(marker=dict(size=13))
     fig.update_xaxes(title="Token trung bình / câu (↑ = tốn hơn)")
     fig.update_yaxes(title="Accuracy (%)")
-    # Chú giải: trỏ đúng điểm Self-Consistency (hồng) lệch xa nhất sang phải.
+    # Chú giải: trỏ đúng điểm Self-Consistency (hồng) lệch xa nhất sang phải,
+    # ghi bội số token + mức tăng so với Zero-CoT CỦA CHÍNH model đó (tính từ dữ liệu).
     sc = g[g["Method"] == "5_Self_Consistency"]
     if not sc.empty:
         far = sc.loc[sc["Tok"].idxmax()]
-        fig.add_annotation(x=float(far["Tok"]), y=float(far["Acc"]),
-                           text="Đắt ~5× mà<br>không cao hơn",
-                           showarrow=True, arrowhead=2, ax=-60, ay=30,
+        zc = g[(g["Model"] == far["Model"]) & (g["Method"] == "3_Zero_Shot_CoT")]
+        if not zc.empty and float(zc["Tok"].iloc[0]) > 0:
+            ratio = float(far["Tok"]) / float(zc["Tok"].iloc[0])
+            gain = float(far["Acc"]) - float(zc["Acc"].iloc[0])
+            note = f"SC ({far['Model']}): ~{ratio:.0f}× token<br>chỉ {gain:+.0f}đ so với Zero-CoT"
+        else:
+            note = "Self-Consistency: tốn token nhất"
+        fig.add_annotation(x=float(far["Tok"]), y=float(far["Acc"]), text=note,
+                           showarrow=True, arrowhead=2, ax=-70, ay=34,
                            font=dict(size=10, color="#52514e"))
     fig = _layout(fig, height=470)
     # Legend nằm ngang, dàn phẳng thành khối chữ nhật dưới biểu đồ (không che điểm).
@@ -134,7 +154,9 @@ def delta_heatmap(summary_df: pd.DataFrame) -> go.Figure:
     delta = (piv["3_Zero_Shot_CoT"] - piv["1_Zero_Shot"]).reset_index(name="Delta")
     delta["Col"] = delta["Model"] + "·" + delta["Language"]
     mat = delta.pivot(index="Difficulty", columns="Col", values="Delta")
-    mat = mat.reindex(DIFF_ORDER)
+    cols = [f"{m}·{l}" for m in _models(delta) for l in ("VI", "EN")
+            if f"{m}·{l}" in mat.columns]
+    mat = mat.reindex(index=DIFF_ORDER, columns=cols)
     fig = px.imshow(
         mat, text_auto=".0f", aspect="auto",
         color_continuous_scale="Blues", zmin=0,
@@ -150,9 +172,9 @@ def delta_heatmap(summary_df: pd.DataFrame) -> go.Figure:
 def lang_dumbbell(summary_df: pd.DataFrame) -> go.Figure:
     df = _short(summary_df)
     g = (df.groupby(["Model", "M", "Language"], as_index=False)["Acc_Pct"].mean())
-    models = ["Small", "Large"]
-    fig = make_subplots(rows=1, cols=2, shared_yaxes=True,
-                        subplot_titles=models, horizontal_spacing=0.08)
+    models = _models(g)
+    fig = make_subplots(rows=1, cols=len(models), shared_yaxes=True,
+                        subplot_titles=models, horizontal_spacing=0.06)
     lang_color = {"VI": "#2a78d6", "EN": "#eb6834"}
     for ci, model in enumerate(models, start=1):
         sub = g[g["Model"] == model]
@@ -177,34 +199,71 @@ def lang_dumbbell(summary_df: pd.DataFrame) -> go.Figure:
                     showlegend=(ci == 1 and m == SHORT_ORDER[0]),
                     hovertemplate=f"{lang} {m}: %{{x:.0f}}%<extra></extra>"),
                     row=1, col=ci)
-    fig.update_xaxes(range=[60, 103], title="Accuracy (%)")
+    # Trục x theo dữ liệu (làm tròn xuống bội 10) để model yếu không bị cắt khỏi khung.
+    lo = max(0, int(np.floor((g["Acc_Pct"].min() - 5) / 10.0) * 10))
+    fig.update_xaxes(range=[lo, 103], title="Accuracy (%)")
     fig.update_yaxes(categoryorder="array", categoryarray=SHORT_ORDER[::-1])
     return _layout(fig, height=420)
 
 
-# 5) CH1 — accuracy tổng theo phương pháp; làm bật Few-Shot (không CoT) < Zero-Shot.
-def method_family_bar(summary_df: pd.DataFrame) -> go.Figure:
+# 5) CH1 — accuracy theo phương pháp, TÁCH THEO MODEL: Few-Shot (không CoT) so với Zero-Shot.
+#    Gộp model sẽ làm sai kết luận (Qwen Zero-Shot lỗi định dạng kéo trung bình xuống).
+#    raw_df (tuỳ chọn) -> thêm thanh khoảng tin cậy Wilson 95% (n=300/cột).
+def method_family_bar(summary_df: pd.DataFrame, raw_df: pd.DataFrame | None = None) -> go.Figure:
+    from . import stats as _stats
     df = _short(summary_df)
-    g = df.groupby(["M", "Method"], as_index=False)["Acc_Pct"].mean().sort_values("Method")
+    g = df.groupby(["Model", "M", "Method"], as_index=False)["Acc_Pct"].mean()
     g["Family"] = g["Method"].apply(
         lambda m: "Không CoT" if m in ("1_Zero_Shot", "2_Few_Shot") else "CoT / biến thể")
-    fig = px.bar(
-        g, x="M", y="Acc_Pct", color="Family", text="Acc_Pct",
-        category_orders={"M": SHORT_ORDER}, color_discrete_map=_FAMILY_HEX,
-    )
-    fig.update_traces(texttemplate="%{text:.0f}", textposition="outside")
-    fig.update_yaxes(range=[0, 105], title="Accuracy (%)")
-    fig.update_xaxes(title="")
-    zs = float(g[g["Method"] == "1_Zero_Shot"]["Acc_Pct"].iloc[0])
-    few = float(g[g["Method"] == "2_Few_Shot"]["Acc_Pct"].iloc[0])
-    fig.add_hline(y=zs, line_dash="dot", line_color="#52514e",
-                  annotation_text="mức Zero-Shot", annotation_position="top right")
-    # Chú thích đỏ đặt hẳn dưới đường nét đứt để không chồng lên nó.
-    fig.add_annotation(x="Few-Shot", y=few,
-                       text="Few-Shot KHÔNG kèm lời giải<br>còn thấp hơn Zero-Shot",
-                       showarrow=True, arrowhead=2, ax=55, ay=60,
-                       align="left", font=dict(size=10, color="#eda100"))
-    return _layout(fig)
+    # Khoảng tin cậy Wilson từ số liệu thô (k đúng / n lượt) theo (Model, Method).
+    ci_map = {}
+    if raw_df is not None:
+        gg = raw_df.groupby(["Model", "Method"])["Correct"].agg(["sum", "size"])
+        for (mo, me), row in gg.iterrows():
+            lo, hi = _stats.wilson_ci(int(row["sum"]), int(row["size"]))
+            ci_map[(mo, me)] = (lo, hi, int(row["size"]))
+    models = _models(g)
+    fig = make_subplots(rows=1, cols=len(models), shared_yaxes=True,
+                        subplot_titles=models, horizontal_spacing=0.05)
+    for ci, model in enumerate(models, start=1):
+        sub = g[g["Model"] == model]
+        for fam, hexc in _FAMILY_HEX.items():
+            part = sub[sub["Family"] == fam]
+            err = None
+            if ci_map:
+                plus, minus, ns = [], [], []
+                for _, pr in part.iterrows():
+                    lo, hi, nn = ci_map.get((model, pr["Method"]), (pr["Acc_Pct"], pr["Acc_Pct"], 0))
+                    plus.append(hi - pr["Acc_Pct"]); minus.append(pr["Acc_Pct"] - lo); ns.append(nn)
+                err = dict(type="data", array=plus, arrayminus=minus,
+                           thickness=1.1, width=3, color="#52514e")
+            fig.add_trace(go.Bar(
+                x=part["M"], y=part["Acc_Pct"], marker_color=hexc, name=fam,
+                legendgroup=fam, showlegend=(ci == 1), text=part["Acc_Pct"],
+                texttemplate="%{text:.0f}", textposition="outside", error_y=err,
+                hovertemplate=f"{model} · %{{x}}: %{{y:.1f}}%<extra></extra>"),
+                row=1, col=ci)
+        zs = sub[sub["Method"] == "1_Zero_Shot"]["Acc_Pct"]
+        few = sub[sub["Method"] == "2_Few_Shot"]["Acc_Pct"]
+        if zs.empty or few.empty:
+            continue
+        zs, few = float(zs.iloc[0]), float(few.iloc[0])
+        fig.add_hline(y=zs, line_dash="dot", line_color="#52514e", row=1, col=ci,
+                      annotation_text="mức Zero-Shot" if ci == 1 else None,
+                      annotation_position="top right")
+        # Chú thích theo đúng chiều của dữ liệu từng model; đặt tránh đường nét đứt.
+        if few < zs:
+            note, ax, ay = "Few-Shot (không lời giải)<br>thấp hơn Zero-Shot", 45, 60
+        else:
+            note, ax, ay = "Few-Shot (không lời giải)<br>cao hơn Zero-Shot", -30, -55
+        fig.add_annotation(x="Few-Shot", y=few, text=note, showarrow=True, arrowhead=2,
+                           ax=ax, ay=ay, align="left", row=1, col=ci,
+                           font=dict(size=9, color="#eda100"))
+    fig.update_xaxes(categoryorder="array", categoryarray=SHORT_ORDER, tickangle=-35)
+    fig.update_yaxes(range=[0, 108])
+    fig.update_yaxes(title_text="Accuracy (%)", row=1, col=1)
+    fig.update_layout(barmode="stack")  # mỗi cột chỉ thuộc 1 nhóm -> không lệch vị trí
+    return _layout(fig, height=400)
 
 
 # 6) CH4 — rò rỉ công thức: Few-Shot CoT (pp4) vs Leaked (pp6) trên tập câu Leaked.
@@ -214,13 +273,16 @@ def leak_effect(leak_df: pd.DataFrame) -> go.Figure:
     df["Loại"] = df["Method"].map({
         "4_Few_Shot_CoT": "pp4 (sạch)",
         "6_Few_Shot_CoT_Leaked": "pp6 (rò rỉ)"})
+    order = [f"{m}·{l}" for m in _models(df) for l in ("VI", "EN")
+             if f"{m}·{l}" in set(df["Col"])]
     fig = px.bar(
         df, x="Col", y="Acc_Pct", color="Loại", barmode="group",
-        text="Acc_Pct",
+        text="Acc_Pct", category_orders={"Col": order},
         color_discrete_map={"pp4 (sạch)": "#898781", "pp6 (rò rỉ)": "#2a78d6"},
     )
     fig.update_traces(texttemplate="%{text:.0f}", textposition="outside")
-    fig.update_yaxes(range=[80, 103], title="Accuracy (%)")
+    lo = max(0, int(np.floor((df["Acc_Pct"].min() - 8) / 10.0) * 10))
+    fig.update_yaxes(range=[lo, 104], title="Accuracy (%)")
     fig.update_xaxes(title="")
     return _layout(fig)
 
@@ -228,31 +290,47 @@ def leak_effect(leak_df: pd.DataFrame) -> go.Figure:
 # ===================== Giai đoạn 3: Tab 3 (CH2+CH3) + Tab 4A =====================
 
 # CH2 — box plot độ tự tin trên câu SAI: Zero-Shot vs Zero-CoT (nền trong + điểm jitter).
+#   TÁCH PANEL THEO MODEL: gộp model sẽ che xu hướng ngược nhau (Gemini/Gemma giảm, Qwen thì không).
 def confidence_on_wrong(raw_df: pd.DataFrame) -> go.Figure:
     w = raw_df[(raw_df["Correct"] == 0) & (raw_df["Confidence"].notna())].copy()
     w = w[w["Method"].isin(["1_Zero_Shot", "3_Zero_Shot_CoT"])]
     order = [("Zero-Shot", "1_Zero_Shot"), ("Zero-CoT", "3_Zero_Shot_CoT")]
-    fig = go.Figure()
-    ticktext = []
-    for short, method in order:
-        col = w[w["Method"] == method]["Confidence"]
-        color = METHOD_COLORS[short]
-        fig.add_trace(go.Box(
-            y=col, name=short, boxpoints="all", jitter=0.6, pointpos=0,
-            fillcolor=_rgba(color, 0.15), line=dict(color=color, width=2),
-            marker=dict(color=color, size=5, opacity=0.55),
-            whiskerwidth=0.4, hovertemplate="%{y:.0f}<extra></extra>"))
-        p90 = (col >= 90).mean() * 100 if len(col) else 0
-        ticktext.append(
-            f"{short}<br><span style='color:#d03b3b'>{p90:.0f}% câu sai vẫn ≥90</span>")
-    # Hộp Zero-Shot dẹt ở 100 (phần lớn câu sai ở mức 100) nhưng điểm jitter vẫn hiện rõ.
-    fig.add_hline(y=90, line_dash="dot", line_color="#d03b3b",
-                  annotation_text="ngưỡng 90", annotation_position="right")
-    fig.update_xaxes(tickmode="array", tickvals=["Zero-Shot", "Zero-CoT"],
-                     ticktext=ticktext, title="")
-    fig.update_yaxes(range=[75, 103], title="Độ tự tin model tự báo (0–100)")
+    models = _models(w)
+    fig = make_subplots(rows=1, cols=len(models), shared_yaxes=True,
+                        subplot_titles=models, horizontal_spacing=0.05)
+    for ci, model in enumerate(models, start=1):
+        ticktext = []
+        for short, method in order:
+            col = w[(w["Model"] == model) & (w["Method"] == method)]["Confidence"]
+            color = METHOD_COLORS[short]
+            fig.add_trace(go.Box(
+                y=col, name=short, boxpoints="all", jitter=0.6, pointpos=0,
+                fillcolor=_rgba(color, 0.15), line=dict(color=color, width=2),
+                marker=dict(color=color, size=5, opacity=0.55), whiskerwidth=0.4,
+                hovertemplate=f"{model} · {short}: %{{y:.0f}}<extra></extra>"), row=1, col=ci)
+            p90 = (col >= 90).mean() * 100 if len(col) else 0
+            ticktext.append(f"{short}<br><span style='color:#d03b3b'>{p90:.0f}% ≥90 "
+                            f"(n={len(col)})</span>")
+        fig.update_xaxes(tickmode="array", tickvals=[s for s, _ in order], ticktext=ticktext,
+                         title="", row=1, col=ci)
+        # Hộp Zero-Shot dẹt ở 100 (phần lớn câu sai ở mức 100) nhưng điểm jitter vẫn hiện rõ.
+        fig.add_hline(y=90, line_dash="dot", line_color="#d03b3b", row=1, col=ci,
+                      annotation_text="ngưỡng 90" if ci == len(models) else None,
+                      annotation_position="right")
+    # Đáy trục theo phân vị 1% (không để 1 điểm lẻ ép dẹt mọi hộp); điểm ngoài khung được ghi chú.
+    lo = (max(0, min(75, int(np.floor((w["Confidence"].quantile(0.01) - 3) / 5.0) * 5)))
+          if len(w) else 75)
+    out = w[w["Confidence"] < lo]
+    if len(out):
+        who = ", ".join(f"{m} {METHOD_SHORT.get(k, k)}: {n}" for (m, k), n in
+                        out.groupby(["Model", "Method"]).size().items())
+        fig.add_annotation(x=1, y=-0.2, xref="paper", yref="paper", xanchor="right",
+                           showarrow=False, font=dict(size=9, color="#52514e"),
+                           text=f"{len(out)} điểm có độ tự tin < {lo} nằm ngoài khung ({who})")
+    fig.update_yaxes(range=[lo, 103])
+    fig.update_yaxes(title_text="Độ tự tin model tự báo (0–100)", row=1, col=1)
     fig.update_layout(showlegend=False)
-    return _layout(fig, height=380)
+    return _layout(fig, height=400)
 
 
 # CH3 — ma trận faithfulness 2×2 (giải đúng/sai × đáp án đúng/sai).
@@ -281,8 +359,8 @@ def error_type_breakdown(baselines_df: pd.DataFrame) -> go.Figure:
     order = (baselines_df["Error_Type"].value_counts().index.tolist())
     fig = px.bar(
         g, x="Error_Type", y="n", color="Model", barmode="group", text="n",
-        category_orders={"Error_Type": order},
-        color_discrete_map={"Small": "#eb6834", "Large": "#2a78d6"},
+        category_orders={"Error_Type": order, "Model": _models(g)},
+        color_discrete_map=MODEL_COLORS,
     )
     fig.update_traces(textposition="outside")
     fig.update_yaxes(title="Số ca", range=[0, 7])
@@ -367,3 +445,37 @@ def sc_vote_bar(votes: dict) -> go.Figure:
     fig.update_yaxes(title="Số phiếu", dtick=1, range=[0, max(ys) + 1])
     fig.update_xaxes(title="Đáp án")
     return _layout(fig, height=260)
+
+
+# CH5 (Qwen 7B) — mỗi can thiệp: số ca sai→đúng (lên) vs đúng→sai (xuống) + mức ròng.
+#   Baseline Qwen đã đúng sẵn một phần nên "tỷ lệ sửa" không đủ; regression là điểm mấu chốt.
+def qwen_fix_regression(qm: pd.DataFrame) -> go.Figure:
+    d = qm.copy()
+    d["M"] = d["Phương pháp"].map(FIX_SHORT).fillna(d["Phương pháp"])
+    d = d.set_index("M").reindex([m for m in FIX_ORDER if m in set(d["M"])]).reset_index()
+    fix = d["Sửa được"].astype(float)
+    reg = d["Regression"].astype(float)
+    net = d["Accuracy sau (%)"].astype(float) - d["Accuracy trước (%)"].astype(float)
+    hover = [f"{m}: {int(a)}% → {int(b)}% (N={int(n)})" for m, a, b, n in
+             zip(d["M"], d["Accuracy trước (%)"], d["Accuracy sau (%)"], d["N hợp lệ"])]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=d["M"], y=fix, name="Sai → đúng (sửa được)",
+                         marker_color="#0ca30c", text=[f"+{int(v)}" for v in fix],
+                         textposition="outside", customdata=hover,
+                         hovertemplate="%{customdata}<br>sửa được: %{y:.0f} ca<extra></extra>"))
+    fig.add_trace(go.Bar(x=d["M"], y=-reg, name="Đúng → sai (regression)",
+                         marker_color="#d03b3b",
+                         text=[f"−{int(v)}" if v else "0" for v in reg],
+                         textposition="outside", customdata=hover,
+                         hovertemplate="%{customdata}<br>regression: %{text} ca<extra></extra>"))
+    fig.add_trace(go.Scatter(x=d["M"], y=fix - reg, mode="markers+text", name="Ròng (sửa − hỏng)",
+                             marker=dict(symbol="diamond", size=12, color="#1a2233"),
+                             text=[f"{v:+.0f}đ" for v in net], textposition="middle right",
+                             textfont=dict(size=10, color="#1a2233"),
+                             hovertemplate="ròng: %{y:+.0f} ca<extra></extra>"))
+    lim = float(max(fix.max(), reg.max())) + 2
+    fig.add_hline(y=0, line_color="#898781", line_width=1)
+    fig.update_yaxes(range=[-lim, lim], title="Số ca (trên 20 câu)", zeroline=False)
+    fig.update_xaxes(title="")
+    fig.update_layout(barmode="relative")
+    return _layout(fig, height=380)
