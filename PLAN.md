@@ -118,8 +118,18 @@ câu số, baseline 8/20).
    - Premise +20 (60%, tốt nhất), Calibration −15 (tệ nhất); sửa 15 / hỏng 11; chỉ **NLI** 0 regression.
    - Bỏ cảnh báo "chưa tin cậy"; kết luận tính động từ số sạch.
 
-### Còn lại của UI (chưa làm)
-- [ ] **C2** Tách Qwen khỏi biểu đồ chi phí (giá giả định/độ trễ tự host).
-- [ ] **C5** Chú thích tên model thật (gemma-4-26b / gemini-3.5-flash-lite / qwen2.5:7b).
-- [ ] (tuỳ chọn) Thêm CI cho thêm biểu đồ accuracy khác (biểu đồ 1).
-- [ ] Commit `sys/web` (app/, stats.py, PLAN, CLAUDE) + push — **chờ người dùng yêu cầu**.
+### Còn lại của UI
+- [x] **C1** Ghi chú SC của Qwen dùng lại Zero-CoT (ảnh hưởng nhỏ vì SC≈Zero-CoT ở cả 3 model).
+- [x] **C2** Cảnh báo chi phí/độ trễ/token Qwen tự host không so xuyên model.
+- [x] **C5** Chú thích tên model thật ở màn mở đầu.
+- [x] **Commit + push `sys/web`** — commit `fffec8f` (`9a26f39..fffec8f`).
+
+### Thực sự còn lại (tuỳ chọn / việc của người khác)
+- [ ] **4.2** Người dùng tự xem trình duyệt (CI, bảng p-value, Tab 4 mục 4).
+- [ ] (tuỳ chọn) Thêm CI cho biểu đồ 1 (độ khó); dọn các loader Qwen cũ không dùng trong `data.py`.
+- [ ] (tuỳ chọn) Mở PR `sys/web` → `main`.
+
+> Toàn bộ Giai đoạn 1–4 ở trên đã hoàn tất (checkbox cũ còn `[ ]` là do chưa tick lúc làm);
+> cách thực hiện khác plan ở chỗ **không dựng sheet `Qwen_*` tay** mà dùng `build_qwen_goi3.py`
+> → `analysis/qwen_goi3_rerun.xlsx` (app đọc qua `data.qwen_rerun`), và **không cần merge main
+> vào sys/web** vì file sạch + bản sửa analysis đã commit thẳng trên `sys/web`.
