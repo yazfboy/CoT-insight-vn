@@ -317,29 +317,54 @@ def is_numeric_question(case_or_type: dict[str, Any] | str) -> bool:
     return "nguyên" in value or "integer" in value or value.strip().lower() in {"number", "numeric"}
 
 
+# --- Parse đáp án: đồng bộ với benchmark/run_benchmark.parse_output ---
+# Lỗi cũ: thiếu tag thì lấy luôn DÒNG CUỐI. Model nhỏ (Qwen) hay ghi đáp án trần rồi mới tới
+# "[Confidence]: 100%" -> dòng cuối là dòng độ tự tin -> câu số bị lấy nhầm "100" làm đáp án.
+# Ngoài ra câu số lấy số ĐẦU dòng (benchmark lấy số CUỐI) -> hai nơi chấm khác nhau.
+ANS_TAG_RE = re.compile(
+    r"(?:Đáp\s+án\s+cuối\s+cùng|Final\s+Answer)\s*\]?\s*\**\s*[:：]\s*\**\s*([^\r\n]*)", re.IGNORECASE)
+BARE_ANS_RE = re.compile(r"^\W*(?:(?:đáp án|answer)\s*[:：]?\s*)?(-?[\d.,]+|[A-D])\W*$", re.IGNORECASE)
+CONF_LINE_RE = re.compile(
+    r"^\W*(?:\[?\s*(?:độ\s*tự\s*tin|confidence)\s*\]?\s*\**\s*[:：]?)?\s*\**\s*(\d{1,3}(?:[.,]\d+)?)\s*%\W*$",
+    re.IGNORECASE)
+CONF_WORD_RE = re.compile(r"độ\s*tự\s*tin|confidence", re.IGNORECASE)
+
+
+def _strip_trailing_conf(lines: list[str]) -> tuple[list[str], float | None]:
+    """Bỏ 1 dòng độ tự tin ở CUỐI nếu dòng đó có tag, hoặc ngay trước nó là dòng chỉ chứa
+    đáp án (vd "B" rồi "80%"). Trả (các dòng còn lại, confidence hoặc None)."""
+    if not lines:
+        return lines, None
+    m = CONF_LINE_RE.match(lines[-1])
+    if m and (CONF_WORD_RE.search(lines[-1]) or (len(lines) > 1 and BARE_ANS_RE.match(lines[-2]))):
+        return lines[:-1], float(m.group(1).replace(",", "."))
+    return lines, None
+
+
 def extract_final_line(text: str) -> str:
-    matches = re.findall(
-        r"(?:\[\s*(?:Final\s+Answer|Đáp\s+án\s+cuối\s+cùng)\s*\]|(?:Final\s+Answer|Đáp\s+án\s+cuối\s+cùng))\s*[:：]\s*([^\r\n]+)",
-        text or "",
-        re.IGNORECASE,
-    )
-    if matches:
-        return matches[-1].strip()
+    """Phần chứa đáp án cuối: nội dung sau tag [Final Answer]/[Đáp án cuối cùng] cuối cùng; nếu
+    không có (hoặc tag trống) thì dòng cuối CHỈ chứa đáp án, sau khi bỏ 1 dòng độ tự tin ở cuối.
+    Trả "" nếu không tìm thấy — không đoán từ câu văn để tránh bắt nhầm số trung gian."""
+    tags = ANS_TAG_RE.findall(text or "")
+    if tags and tags[-1].strip(" *"):
+        return tags[-1].strip(" *")
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+    body, _ = _strip_trailing_conf(lines)
+    if body and BARE_ANS_RE.match(body[-1]):
+        return body[-1]
+    return ""
 
 
 def normalize_answer(text: str, category: str) -> str | None:
     final = extract_final_line(text)
+    if not final:
+        return None
     if is_numeric_question(category):
-        return norm_numeric(final)
+        s = re.sub(r"(?<=\d)[.,](?=\d{3}\b)", "", final)  # bỏ dấu phân cách hàng nghìn: 1,200
+        nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+        return norm_numeric(nums[-1]) if nums else None   # số CUỐI, giống benchmark
     m = re.search(r"\b([A-D])\b", final.upper())
-    if m:
-        return m.group(1)
-    # A response may put the choice label in its final line without brackets.
-    if re.fullmatch(r"\(?\s*[A-D]\s*\)?[.)]??", final.upper()):
-        return final.strip(" ()).")
-    return None
+    return m.group(1) if m else None
 
 
 def normalize_ground_truth(value: str, category: str) -> str | None:
@@ -351,12 +376,17 @@ def normalize_ground_truth(value: str, category: str) -> str | None:
 
 def parse_confidence(text: str) -> float:
     matches = re.findall(r"(?:\[\s*(?:Confidence|Độ\s*tự\s*tin)\s*\]|(?:Confidence|Độ\s*tự\s*tin))\s*[:：]\s*(\d+(?:[.,]\d+)?)\s*%?", text or "", re.IGNORECASE)
-    if not matches:
-        return 50.0
-    try:
-        return float(matches[-1].replace(",", "."))
-    except ValueError:
-        return 50.0
+    if matches:
+        try:
+            return float(matches[-1].replace(",", "."))
+        except ValueError:
+            pass
+    # Không có tag: nhận dòng độ tự tin trần ở cuối (vd "B" rồi "80%").
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    _, conf = _strip_trailing_conf(lines)
+    if conf is not None:
+        return min(100.0, max(0.0, conf))
+    return 50.0
 
 
 def logprob_confidence(avg_logprobs: Any) -> float | None:
