@@ -4,3 +4,6 @@ __pycache__/
 ~$*.xlsx
 # Output thô khi chạy lại Qwen Gói 3 (không commit)
 benchmark_output_qwen_v2/
+
+# Dữ liệu JSON của web do scripts/build_web_data.py sinh ra (GitHub Actions build lại khi deploy)
+web/data/

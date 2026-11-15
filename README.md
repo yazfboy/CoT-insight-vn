@@ -97,6 +97,20 @@ The app auto-loads the newest `benchmark/results/benchmark_results_*.xlsx`. Four
 The app is read-only unless you press **"Call API"** (which needs `.env`). Charts cannot be exported
 to image in headless environments (no kaleido); view them in the browser.
 
+### 3.1 Static web dashboard (GitHub Pages)
+
+A static version of the dashboard lives in `web/` and is published at
+<https://yazfboy.github.io/CoT-insight-vn/>. It needs no Python backend: the data is pre-built to JSON.
+
+```bash
+python scripts/build_web_data.py      # newest results .xlsx -> web/data/*.json (+ web/data/logs/<ID>.json)
+python -m http.server 8000 -d web     # then open http://localhost:8000
+```
+
+`web/data/` is git-ignored; `.github/workflows/deploy.yml` rebuilds it and deploys `web/` on every push
+to `main`. The "Live Test" mode in Tab 1 calls the Gemini REST API from the browser with a key the
+visitor types in (kept in memory only).
+
 ---
 
 ## 4. Re-run the benchmark (optional)
